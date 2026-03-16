@@ -69,7 +69,10 @@ export function estimateTimelineMessageHeight(
 ): number {
   if (message.role === "assistant") {
     const charsPerLine = estimateCharsPerLineForAssistant(layout.timelineWidthPx);
-    const estimatedLines = estimateWrappedLineCount(message.text, charsPerLine);
+    const estimatedLines = estimateWrappedLineCount(
+      stripWorkloopStopSignal(message.text),
+      charsPerLine,
+    );
     return ASSISTANT_BASE_HEIGHT_PX + estimatedLines * LINE_HEIGHT_PX;
   }
 
@@ -88,3 +91,4 @@ export function estimateTimelineMessageHeight(
   const estimatedLines = estimateWrappedLineCount(message.text, charsPerLine);
   return ASSISTANT_BASE_HEIGHT_PX + estimatedLines * LINE_HEIGHT_PX;
 }
+import { stripWorkloopStopSignal } from "../workloop";

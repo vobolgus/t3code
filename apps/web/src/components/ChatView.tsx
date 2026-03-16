@@ -136,6 +136,7 @@ import {
   FolderClosedIcon,
   LockIcon,
   LockOpenIcon,
+  RefreshCwIcon,
   Undo2Icon,
   XIcon,
   CopyIcon,
@@ -217,6 +218,16 @@ import { selectThreadTerminalState, useTerminalStateStore } from "../terminalSta
 import { clamp } from "effect/Number";
 import { ComposerPromptEditor, type ComposerPromptEditorHandle } from "./ComposerPromptEditor";
 import { estimateTimelineMessageHeight } from "./timelineHeight";
+import WorkloopDialog from "./WorkloopDialog";
+import {
+  buildWorkloopTurnPrompt,
+  getNextWorkloopPrompt,
+  parseWorkloopPrompts,
+  readPersistedWorkloopPromptText,
+  stripWorkloopStopSignal,
+  shouldStopWorkloopFromAssistantMessage,
+  writePersistedWorkloopPromptText,
+} from "../workloop";
 
 function formatMessageMeta(createdAt: string, duration: string | null): string {
   if (!duration) return formatTimestamp(createdAt);
@@ -644,6 +655,14 @@ export default function ChatView({ threadId }: ChatViewProps) {
   const [lastInvokedScriptByProjectId, setLastInvokedScriptByProjectId] = useState<
     Record<string, string>
   >(() => readLastInvokedScriptByProjectFromStorage());
+  const [workloopDialogOpen, setWorkloopDialogOpen] = useState(false);
+  const [workloopPromptText, setWorkloopPromptText] = useState(() =>
+    readPersistedWorkloopPromptText(threadId),
+  );
+  const [workloopActive, setWorkloopActive] = useState(false);
+  const [workloopNextPromptIndex, setWorkloopNextPromptIndex] = useState(0);
+  const [workloopAwaitingTurnCompletion, setWorkloopAwaitingTurnCompletion] = useState(false);
+  const [workloopBaselineTurnId, setWorkloopBaselineTurnId] = useState<string | null>(null);
   const messagesScrollRef = useRef<HTMLDivElement>(null);
   const [messagesScrollElement, setMessagesScrollElement] = useState<HTMLDivElement | null>(null);
   const shouldAutoScrollRef = useRef(true);
@@ -668,6 +687,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
   const attachmentPreviewHandoffByMessageIdRef = useRef<Record<string, string[]>>({});
   const attachmentPreviewHandoffTimeoutByMessageIdRef = useRef<Record<string, number>>({});
   const sendInFlightRef = useRef(false);
+  const workloopDispatchInFlightRef = useRef(false);
   const dragDepthRef = useRef(0);
   const terminalOpenByThreadRef = useRef<Record<string, boolean>>({});
   const setMessagesScrollContainerRef = useCallback((element: HTMLDivElement | null) => {
@@ -741,6 +761,17 @@ export default function ChatView({ threadId }: ChatViewProps) {
   const activeLatestTurn = activeThread?.latestTurn ?? null;
   const latestTurnSettled = isLatestTurnSettled(activeLatestTurn, activeThread?.session ?? null);
   const activeProject = projects.find((p) => p.id === activeThread?.projectId);
+  const workloopPrompts = useMemo(
+    () => parseWorkloopPrompts(workloopPromptText),
+    [workloopPromptText],
+  );
+  const latestAssistantMessage = useMemo(() => {
+    const assistantMessageId = activeLatestTurn?.assistantMessageId;
+    if (!assistantMessageId || !activeThread) {
+      return null;
+    }
+    return activeThread.messages.find((message) => message.id === assistantMessageId) ?? null;
+  }, [activeLatestTurn?.assistantMessageId, activeThread]);
 
   useEffect(() => {
     if (!activeThread?.id) return;
@@ -908,6 +939,22 @@ export default function ChatView({ threadId }: ChatViewProps) {
     activeProposedPlan !== null;
   const activePendingApproval = pendingApprovals[0] ?? null;
   const isComposerApprovalState = activePendingApproval !== null;
+  const workloopCanStart =
+    isServerThread &&
+    workloopPrompts.length > 0 &&
+    activePendingApproval === null &&
+    pendingUserInputs.length === 0;
+  const workloopStatusLabel = workloopActive
+    ? activePendingApproval
+      ? "Workloop is waiting for an approval response."
+      : pendingUserInputs.length > 0
+        ? "Workloop is waiting for required user input."
+        : phase === "running"
+          ? "Workloop will continue after the current turn finishes."
+          : "Workloop is active."
+    : !isServerThread
+      ? "Send the first message manually before starting workloop on this thread."
+      : null;
   const hasComposerHeader =
     isComposerApprovalState ||
     pendingUserInputs.length > 0 ||
@@ -1936,6 +1983,20 @@ export default function ChatView({ threadId }: ChatViewProps) {
   }, [prompt]);
 
   useEffect(() => {
+    setWorkloopDialogOpen(false);
+    setWorkloopPromptText(readPersistedWorkloopPromptText(threadId));
+    setWorkloopActive(false);
+    setWorkloopNextPromptIndex(0);
+    setWorkloopAwaitingTurnCompletion(false);
+    setWorkloopBaselineTurnId(null);
+    workloopDispatchInFlightRef.current = false;
+  }, [threadId]);
+
+  useEffect(() => {
+    writePersistedWorkloopPromptText(threadId, workloopPromptText);
+  }, [threadId, workloopPromptText]);
+
+  useEffect(() => {
     setOptimisticUserMessages((existing) => {
       for (const message of existing) {
         revokeUserMessagePreviewUrls(message);
@@ -2331,6 +2392,120 @@ export default function ChatView({ threadId }: ChatViewProps) {
       setIsRevertingCheckpoint(false);
     },
     [activeThread, isConnecting, isRevertingCheckpoint, isSendBusy, phase, setThreadError],
+  );
+
+  const sendDirectTextTurn = useCallback(
+    async ({
+      text,
+      errorMessage,
+      interactionModeOverride,
+      syncDraftInteractionMode = false,
+    }: {
+      text: string;
+      errorMessage: string;
+      interactionModeOverride?: ProviderInteractionMode;
+      syncDraftInteractionMode?: boolean;
+    }): Promise<boolean> => {
+      const api = readNativeApi();
+      if (
+        !api ||
+        !activeThread ||
+        !isServerThread ||
+        isSendBusy ||
+        isConnecting ||
+        sendInFlightRef.current
+      ) {
+        return false;
+      }
+
+      const trimmed = text.trim();
+      if (!trimmed) {
+        return false;
+      }
+
+      const threadIdForSend = activeThread.id;
+      const messageIdForSend = newMessageId();
+      const messageCreatedAt = new Date().toISOString();
+      const nextInteractionMode = interactionModeOverride ?? interactionMode;
+
+      sendInFlightRef.current = true;
+      setSendPhase("sending-turn");
+      setThreadError(threadIdForSend, null);
+      setOptimisticUserMessages((existing) => [
+        ...existing,
+        {
+          id: messageIdForSend,
+          role: "user",
+          text: trimmed,
+          createdAt: messageCreatedAt,
+          streaming: false,
+        },
+      ]);
+      shouldAutoScrollRef.current = true;
+      forceStickToBottom();
+
+      try {
+        await persistThreadSettingsForNextTurn({
+          threadId: threadIdForSend,
+          createdAt: messageCreatedAt,
+          ...(selectedModel ? { model: selectedModel } : {}),
+          runtimeMode,
+          interactionMode: nextInteractionMode,
+        });
+
+        if (syncDraftInteractionMode) {
+          setComposerDraftInteractionMode(threadIdForSend, nextInteractionMode);
+        }
+
+        await api.orchestration.dispatchCommand({
+          type: "thread.turn.start",
+          commandId: newCommandId(),
+          threadId: threadIdForSend,
+          message: {
+            messageId: messageIdForSend,
+            role: "user",
+            text: trimmed,
+            attachments: [],
+          },
+          provider: selectedProvider,
+          model: selectedModel || undefined,
+          ...(selectedModelOptionsForDispatch ? { modelOptions: selectedModelOptionsForDispatch } : {}),
+          assistantDeliveryMode: settings.enableAssistantStreaming ? "streaming" : "buffered",
+          runtimeMode,
+          interactionMode: nextInteractionMode,
+          createdAt: messageCreatedAt,
+        });
+        return true;
+      } catch (err) {
+        setOptimisticUserMessages((existing) =>
+          existing.filter((message) => message.id !== messageIdForSend),
+        );
+        setThreadError(
+          threadIdForSend,
+          err instanceof Error ? err.message : errorMessage,
+        );
+        return false;
+      } finally {
+        sendInFlightRef.current = false;
+        setSendPhase("idle");
+      }
+    },
+    [
+      activeThread,
+      forceStickToBottom,
+      interactionMode,
+      isConnecting,
+      isSendBusy,
+      isServerThread,
+      persistThreadSettingsForNextTurn,
+      runtimeMode,
+      selectedModel,
+      selectedModelOptionsForDispatch,
+      selectedProvider,
+      setComposerDraftInteractionMode,
+      setThreadError,
+      settings.enableAssistantStreaming,
+    ],
   );
 
   const onSend = async (e?: { preventDefault: () => void }) => {
@@ -2790,90 +2965,173 @@ export default function ChatView({ threadId }: ChatViewProps) {
       if (!trimmed) {
         return;
       }
-
-      const threadIdForSend = activeThread.id;
-      const messageIdForSend = newMessageId();
-      const messageCreatedAt = new Date().toISOString();
-
-      sendInFlightRef.current = true;
-      setSendPhase("sending-turn");
-      setThreadError(threadIdForSend, null);
-      setOptimisticUserMessages((existing) => [
-        ...existing,
-        {
-          id: messageIdForSend,
-          role: "user",
-          text: trimmed,
-          createdAt: messageCreatedAt,
-          streaming: false,
-        },
-      ]);
-      shouldAutoScrollRef.current = true;
-      forceStickToBottom();
-
-      try {
-        await persistThreadSettingsForNextTurn({
-          threadId: threadIdForSend,
-          createdAt: messageCreatedAt,
-          ...(selectedModel ? { model: selectedModel } : {}),
-          runtimeMode,
-          interactionMode: nextInteractionMode,
-        });
-
-        // Keep the mode toggle and plan-follow-up banner in sync immediately
-        // while the same-thread implementation turn is starting.
-        setComposerDraftInteractionMode(threadIdForSend, nextInteractionMode);
-
-        await api.orchestration.dispatchCommand({
-          type: "thread.turn.start",
-          commandId: newCommandId(),
-          threadId: threadIdForSend,
-          message: {
-            messageId: messageIdForSend,
-            role: "user",
-            text: trimmed,
-            attachments: [],
-          },
-          provider: selectedProvider,
-          model: selectedModel || undefined,
-          ...(selectedModelOptionsForDispatch
-            ? { modelOptions: selectedModelOptionsForDispatch }
-            : {}),
-          assistantDeliveryMode: settings.enableAssistantStreaming ? "streaming" : "buffered",
-          runtimeMode,
-          interactionMode: nextInteractionMode,
-          createdAt: messageCreatedAt,
-        });
-        sendInFlightRef.current = false;
-        setSendPhase("idle");
-      } catch (err) {
-        setOptimisticUserMessages((existing) =>
-          existing.filter((message) => message.id !== messageIdForSend),
-        );
-        setThreadError(
-          threadIdForSend,
-          err instanceof Error ? err.message : "Failed to send plan follow-up.",
-        );
-        sendInFlightRef.current = false;
-        setSendPhase("idle");
-      }
+      await sendDirectTextTurn({
+        text: trimmed,
+        errorMessage: "Failed to send plan follow-up.",
+        interactionModeOverride: nextInteractionMode,
+        syncDraftInteractionMode: true,
+      });
     },
     [
       activeThread,
-      forceStickToBottom,
       isConnecting,
       isSendBusy,
       isServerThread,
-      persistThreadSettingsForNextTurn,
-      runtimeMode,
-      selectedModel,
-      selectedModelOptionsForDispatch,
-      selectedProvider,
-      setComposerDraftInteractionMode,
-      setThreadError,
-      settings.enableAssistantStreaming,
+      sendDirectTextTurn,
     ],
   );
+
+  const sendNextWorkloopPrompt = useCallback(async (): Promise<boolean> => {
+    const nextPrompt = getNextWorkloopPrompt(workloopPrompts, workloopNextPromptIndex);
+    if (!nextPrompt) {
+      return false;
+    }
+
+    const started = await sendDirectTextTurn({
+      text: buildWorkloopTurnPrompt(nextPrompt.prompt),
+      errorMessage: "Failed to send workloop prompt.",
+    });
+    if (!started) {
+      return false;
+    }
+
+    setWorkloopNextPromptIndex(nextPrompt.nextPromptIndex);
+    return true;
+  }, [sendDirectTextTurn, workloopNextPromptIndex, workloopPrompts]);
+
+  const stopWorkloop = useCallback(() => {
+    setWorkloopActive(false);
+    setWorkloopNextPromptIndex(0);
+    setWorkloopAwaitingTurnCompletion(false);
+    setWorkloopBaselineTurnId(null);
+    workloopDispatchInFlightRef.current = false;
+  }, []);
+
+  const startWorkloop = useCallback(async () => {
+    if (!activeThread || !isServerThread) {
+      if (activeThread?.id) {
+        setThreadError(
+          activeThread.id,
+          "Start the first turn manually before enabling workloop on this thread.",
+        );
+      }
+      return;
+    }
+
+    if (workloopPrompts.length === 0) {
+      setThreadError(activeThread.id, "Add at least one workloop prompt.");
+      return;
+    }
+
+    if (activePendingApproval || pendingUserInputs.length > 0) {
+      setThreadError(
+        activeThread.id,
+        "Resolve pending approvals or user input before starting workloop.",
+      );
+      return;
+    }
+
+    setWorkloopActive(true);
+    setWorkloopAwaitingTurnCompletion(false);
+    setWorkloopBaselineTurnId(activeLatestTurn?.turnId ?? null);
+
+    if (phase === "running" || isSendBusy || isConnecting || sendInFlightRef.current) {
+      return;
+    }
+
+    workloopDispatchInFlightRef.current = true;
+    const baselineTurnId = activeLatestTurn?.turnId ?? null;
+    const started = await sendNextWorkloopPrompt();
+    workloopDispatchInFlightRef.current = false;
+    if (!started) {
+      stopWorkloop();
+      return;
+    }
+    setWorkloopBaselineTurnId(baselineTurnId);
+    setWorkloopAwaitingTurnCompletion(true);
+  }, [
+    activeLatestTurn?.turnId,
+    activePendingApproval,
+    activeThread,
+    isConnecting,
+    isSendBusy,
+    isServerThread,
+    pendingUserInputs.length,
+    phase,
+    sendNextWorkloopPrompt,
+    setThreadError,
+    stopWorkloop,
+    workloopPrompts.length,
+  ]);
+
+  useEffect(() => {
+    if (!workloopActive || !activeThread || !isServerThread) {
+      return;
+    }
+    if (workloopDispatchInFlightRef.current) {
+      return;
+    }
+    if (phase === "running" || isSendBusy || isConnecting || sendInFlightRef.current) {
+      return;
+    }
+    if (!latestTurnSettled) {
+      return;
+    }
+    if (activePendingApproval || pendingUserInputs.length > 0) {
+      return;
+    }
+
+    if (!workloopAwaitingTurnCompletion) {
+      workloopDispatchInFlightRef.current = true;
+      const baselineTurnId = activeLatestTurn?.turnId ?? null;
+      void sendNextWorkloopPrompt().then((started) => {
+        workloopDispatchInFlightRef.current = false;
+        if (!started) {
+          stopWorkloop();
+          return;
+        }
+        setWorkloopBaselineTurnId(baselineTurnId);
+        setWorkloopAwaitingTurnCompletion(true);
+      });
+      return;
+    }
+
+    if (!latestTurnSettled) {
+      return;
+    }
+
+    const completedTurnId = activeLatestTurn?.turnId ?? null;
+    if (!completedTurnId || completedTurnId === workloopBaselineTurnId) {
+      return;
+    }
+
+    if (
+      latestAssistantMessage &&
+      shouldStopWorkloopFromAssistantMessage(latestAssistantMessage.text)
+    ) {
+      stopWorkloop();
+      return;
+    }
+
+    setWorkloopBaselineTurnId(completedTurnId);
+    setWorkloopAwaitingTurnCompletion(false);
+  }, [
+    activeLatestTurn?.turnId,
+    activePendingApproval,
+    activeThread,
+    isConnecting,
+    isSendBusy,
+    isServerThread,
+    latestAssistantMessage,
+    latestTurnSettled,
+    pendingUserInputs.length,
+    phase,
+    sendNextWorkloopPrompt,
+    stopWorkloop,
+    workloopActive,
+    workloopAwaitingTurnCompletion,
+    workloopBaselineTurnId,
+  ]);
 
   const onImplementPlanInNewThread = useCallback(async () => {
     const api = readNativeApi();
@@ -3625,6 +3883,20 @@ export default function ChatView({ threadId }: ChatViewProps) {
                       {runtimeMode === "full-access" ? "Full access" : "Supervised"}
                     </span>
                   </Button>
+
+                  <Separator orientation="vertical" className="mx-0.5 hidden h-4 sm:block" />
+
+                  <Button
+                    variant={workloopActive ? "outline" : "ghost"}
+                    className="shrink-0 whitespace-nowrap px-2 text-muted-foreground/70 hover:text-foreground/80 sm:px-3"
+                    size="sm"
+                    type="button"
+                    onClick={() => setWorkloopDialogOpen(true)}
+                    title="Configure and run a repeating prompt loop for this thread"
+                  >
+                    <RefreshCwIcon className={cn("size-4", workloopActive && "text-primary")} />
+                    <span className="sr-only sm:not-sr-only">Workloop</span>
+                  </Button>
                 </div>
 
                 {/* Right side: send / stop button */}
@@ -3790,6 +4062,22 @@ export default function ChatView({ threadId }: ChatViewProps) {
           </div>
         </form>
       </div>
+
+      <WorkloopDialog
+        open={workloopDialogOpen}
+        threadId={threadId}
+        promptText={workloopPromptText}
+        prompts={workloopPrompts}
+        active={workloopActive}
+        nextPromptIndex={workloopNextPromptIndex}
+        disabled={isSendBusy || isConnecting}
+        canStart={workloopCanStart}
+        statusLabel={workloopStatusLabel}
+        onOpenChange={setWorkloopDialogOpen}
+        onPromptTextChange={setWorkloopPromptText}
+        onStart={() => void startWorkloop()}
+        onStop={stopWorkloop}
+      />
 
       {isGitRepo && (
         <BranchToolbar
@@ -4270,12 +4558,13 @@ const ComposerPlanFollowUpBanner = memo(function ComposerPlanFollowUpBanner({
 
 const MessageCopyButton = memo(function MessageCopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
+  const sanitizedText = useMemo(() => stripWorkloopStopSignal(text), [text]);
 
   const handleCopy = useCallback(() => {
-    void navigator.clipboard.writeText(text);
+    void navigator.clipboard.writeText(sanitizedText);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
-  }, [text]);
+  }, [sanitizedText]);
 
   return (
     <Button type="button" size="xs" variant="outline" onClick={handleCopy} title="Copy message">
@@ -5021,7 +5310,9 @@ const MessagesTimeline = memo(function MessagesTimeline({
       {row.kind === "message" &&
         row.message.role === "assistant" &&
         (() => {
-          const messageText = row.message.text || (row.message.streaming ? "" : "(empty response)");
+          const sanitizedMessageText = stripWorkloopStopSignal(row.message.text);
+          const messageText =
+            sanitizedMessageText || (row.message.streaming ? "" : "(empty response)");
           return (
             <>
               {row.showCompletionDivider && (
@@ -5034,11 +5325,11 @@ const MessagesTimeline = memo(function MessagesTimeline({
                 </div>
               )}
               <div className="min-w-0 px-1 py-0.5">
-                <ChatMarkdown
-                  text={messageText}
-                  cwd={markdownCwd}
-                  isStreaming={Boolean(row.message.streaming)}
-                />
+                  <ChatMarkdown
+                    text={messageText}
+                    cwd={markdownCwd}
+                    isStreaming={Boolean(row.message.streaming)}
+                  />
                 {(() => {
                   const turnSummary = turnDiffSummaryByAssistantMessageId.get(row.message.id);
                   if (!turnSummary) return null;
